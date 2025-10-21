@@ -1,0 +1,23 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/**/*.js",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/analyze-pronunciation",
+      "dest": "/api/analyze-pronunciation.js"
+    },
+    {
+      "src": "/api/get-phrase",
+      "dest": "/api/analyze-pronunciation.js",
+      "methods": ["GET"]
+    }
+  ],
+  "env": {
+    "WIT_AI_TOKEN": "@wit-ai-token"
+  }
+}
