@@ -16,8 +16,5 @@
       "dest": "/api/analyze-pronunciation.js",
       "methods": ["GET"]
     }
-  ],
-  "env": {
-    "WIT_AI_TOKEN": "I5ORWI37B4Q5UB5WCIWW5IZN3M2XMJAX"
-  }
+  ]
 }
