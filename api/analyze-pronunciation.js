@@ -1,12 +1,111 @@
 // api/analyze-pronunciation.js
-// Vercel Serverless Function
+// Vercel Serverless Function - Modular Pronunciation Analysis
 
 import fetch from 'node-fetch';
 import FormData from 'form-data';
 
+// Importa as funções dos outros módulos
+import { convertTextToIPA, convertWordToIPA, getIPACoverage } from './ipaConverter.js';
+import {
+  analyzeWords,
+  analyzePronunciation,
+  getPronunciationTips,
+  generateFeedback
+} from './phonemeAnalyzer.js';
+
+// Importa Firebase config para buscar frases
+import { initializeApp } from 'firebase/app';
+import { getFirestore, collection, doc, getDoc, query, where, getDocs } from 'firebase/firestore';
+
 /**
  * ========================================
- * SERVIÇO DE TRANSCRIÇÃO - WIT.AI
+ * FIREBASE CONFIGURATION
+ * ========================================
+ */
+const firebaseConfig = {
+  apiKey: process.env.FIREBASE_API_KEY || "AIzaSyAt2pGCDu7UgdRBGvOFb98jwdUNE_vydiI",
+  authDomain: "learnfun-2e26f.firebaseapp.com",
+  projectId: "learnfun-2e26f",
+  storageBucket: "learnfun-2e26f.firebasestorage.app",
+  messagingSenderId: "620241304009",
+  appId: "1:620241304009:web:0ba10caafa660e99a89018"
+};
+
+let db = null;
+
+const initFirebase = () => {
+  if (!db) {
+    const app = initializeApp(firebaseConfig);
+    db = getFirestore(app);
+  }
+  return db;
+};
+
+/**
+ * ========================================
+ * PHRASE REPOSITORY
+ * ========================================
+ */
+class PhraseRepository {
+  static async getPhraseById(phraseId) {
+    try {
+      const db = initFirebase();
+      const phraseRef = doc(db, 'phrases', phraseId);
+      const phraseSnap = await getDoc(phraseRef);
+
+      if (phraseSnap.exists()) {
+        return {
+          id: phraseSnap.id,
+          ...phraseSnap.data()
+        };
+      }
+
+      return null;
+    } catch (error) {
+      console.error('Error fetching phrase:', error);
+      return null;
+    }
+  }
+
+  static async getRandomPhrase(difficulty = null, environment = 'production') {
+    try {
+      const db = initFirebase();
+      let q = collection(db, 'phrases');
+
+      // Filtra por dificuldade se fornecida
+      if (difficulty) {
+        q = query(q, where('difficulty', '==', difficulty));
+      }
+
+      // Filtra por ambiente (production apenas em produção)
+      if (environment === 'production') {
+        q = query(q, where('environment', '!=', 'development'));
+      }
+
+      const querySnapshot = await getDocs(q);
+      const phrases = querySnapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+
+      if (phrases.length === 0) {
+        return null;
+      }
+
+      // Retorna frase aleatória
+      const randomIndex = Math.floor(Math.random() * phrases.length);
+      return phrases[randomIndex];
+
+    } catch (error) {
+      console.error('Error fetching random phrase:', error);
+      return null;
+    }
+  }
+}
+
+/**
+ * ========================================
+ * TRANSCRIPTION SERVICE - WIT.AI
  * ========================================
  */
 class WitAIService {
@@ -21,7 +120,7 @@ class WitAIService {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${this.apiToken}`,
-          'Content-Type': 'audio/ogg', // WhatsApp usa OGG
+          'Content-Type': 'audio/ogg',
           'Transfer-Encoding': 'chunked'
         },
         body: audioBuffer
@@ -35,7 +134,7 @@ class WitAIService {
 
       return {
         text: data.text || '',
-        confidence: data.traits ? 1.0 : 0.8, // Wit.ai não retorna confidence direto
+        confidence: data.traits ? 1.0 : 0.8,
         isSuccess: data.text && data.text.length > 0
       };
 
@@ -48,352 +147,199 @@ class WitAIService {
 
 /**
  * ========================================
- * LÓGICA DE ANÁLISE DE PRONÚNCIA
- * (Extraída do seu código React)
- * ========================================
- */
-class PronunciationAnalyzer {
-
-  /**
-   * Analisa a pronúncia comparando texto esperado vs transcrito
-   */
-  analyze(expectedText, userTranscript) {
-    const expected = this.normalize(expectedText);
-    const user = this.normalize(userTranscript);
-
-    const expectedWords = expected.split(/\s+/);
-    const userWords = user.split(/\s+/);
-
-    const wordAnalysis = [];
-    let correctCount = 0;
-
-    // Análise palavra por palavra
-    for (let i = 0; i < expectedWords.length; i++) {
-      const expectedWord = expectedWords[i];
-      const userWord = userWords[i] || null;
-
-      const result = this.compareWords(expectedWord, userWord);
-      wordAnalysis.push(result);
-
-      if (result.status === 'correct') {
-        correctCount++;
-      }
-    }
-
-    // Calcula acurácia geral
-    const accuracy = Math.round((correctCount / expectedWords.length) * 100);
-
-    return {
-      overall: {
-        expected: expectedText,
-        userSaid: userTranscript,
-        accuracy: accuracy,
-        status: this.getStatus(accuracy)
-      },
-      wordByWord: wordAnalysis
-    };
-  }
-
-  /**
-   * Compara duas palavras
-   */
-  compareWords(expected, user) {
-    if (!user) {
-      return {
-        expected: expected,
-        userSaid: '(not detected)',
-        status: 'missing',
-        confidence: 0
-      };
-    }
-
-    if (expected === user) {
-      return {
-        expected: expected,
-        userSaid: user,
-        status: 'correct',
-        confidence: 100
-      };
-    }
-
-    // Calcula similaridade
-    const similarity = this.calculateSimilarity(expected, user);
-
-    if (similarity > 0.8) {
-      return {
-        expected: expected,
-        userSaid: user,
-        status: 'similar',
-        confidence: Math.round(similarity * 100)
-      };
-    }
-
-    return {
-      expected: expected,
-      userSaid: user,
-      status: 'wrong',
-      confidence: Math.round(similarity * 100)
-    };
-  }
-
-  /**
-   * Normaliza texto (remove acentos, lowercase, trim)
-   */
-  normalize(text) {
-    return text
-      .toLowerCase()
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .replace(/[^\w\s]/g, '')
-      .trim();
-  }
-
-  /**
-   * Calcula similaridade entre strings (Levenshtein)
-   */
-  calculateSimilarity(s1, s2) {
-    const longer = s1.length > s2.length ? s1 : s2;
-    const shorter = s1.length > s2.length ? s2 : s1;
-
-    if (longer.length === 0) return 1.0;
-
-    const editDistance = this.levenshteinDistance(longer, shorter);
-    return (longer.length - editDistance) / longer.length;
-  }
-
-  /**
-   * Distância de Levenshtein
-   */
-  levenshteinDistance(s1, s2) {
-    const costs = [];
-    for (let i = 0; i <= s1.length; i++) {
-      let lastValue = i;
-      for (let j = 0; j <= s2.length; j++) {
-        if (i === 0) {
-          costs[j] = j;
-        } else if (j > 0) {
-          let newValue = costs[j - 1];
-          if (s1.charAt(i - 1) !== s2.charAt(j - 1)) {
-            newValue = Math.min(Math.min(newValue, lastValue), costs[j]) + 1;
-          }
-          costs[j - 1] = lastValue;
-          lastValue = newValue;
-        }
-      }
-      if (i > 0) costs[s2.length] = lastValue;
-    }
-    return costs[s2.length];
-  }
-
-  /**
-   * Retorna status baseado na acurácia
-   */
-  getStatus(accuracy) {
-    if (accuracy >= 80) return 'excellent';
-    if (accuracy >= 60) return 'good';
-    if (accuracy >= 40) return 'needsPractice';
-    return 'poor';
-  }
-
-  /**
-   * Gera dicas de pronúncia baseadas nos erros
-   */
-  generateTips(wordAnalysis) {
-    const tips = [];
-
-    wordAnalysis.forEach(word => {
-      if (word.status === 'wrong' || word.status === 'similar') {
-        tips.push({
-          word: word.expected,
-          issue: `You said "${word.userSaid}" but it should be "${word.expected}"`,
-          tip: this.getPhoneticTip(word.expected)
-        });
-      } else if (word.status === 'missing') {
-        tips.push({
-          word: word.expected,
-          issue: `The word "${word.expected}" was not detected`,
-          tip: 'Try to speak more clearly and at a moderate pace'
-        });
-      }
-    });
-
-    return tips.slice(0, 3); // Máximo 3 dicas
-  }
-
-  /**
-   * Gera dica fonética (simplificada)
-   */
-  getPhoneticTip(word) {
-    // Aqui você pode integrar com seu IPA converter se quiser
-    const tips = {
-      'hello': 'Pronounce: /həˈloʊ/ - Start with soft "h", end with "low"',
-      'how': 'Pronounce: /haʊ/ - Like "h" + "ow" in "cow"',
-      'are': 'Pronounce: /ɑr/ - Open mouth, "ar" sound',
-      'you': 'Pronounce: /ju/ - Quick "y" sound + "oo"',
-    };
-
-    return tips[word.toLowerCase()] || `Focus on pronouncing "${word}" clearly`;
-  }
-}
-
-/**
- * ========================================
- * REPOSITÓRIO DE FRASES
- * (Reutilizado do seu projeto React)
- * ========================================
- */
-const PHRASES = [
-  {
-    id: 1,
-    text: "Hello, how are you?",
-    difficulty: 'easy',
-    ipa: '/həˈloʊ haʊ ɑr ju/',
-    translation: 'Olá, como você está?'
-  },
-  {
-    id: 2,
-    text: "I'm learning English",
-    difficulty: 'easy',
-    ipa: '/aɪm ˈlɜrnɪŋ ˈɪŋɡlɪʃ/',
-    translation: 'Estou aprendendo inglês'
-  },
-  {
-    id: 3,
-    text: "The weather is beautiful today",
-    difficulty: 'medium',
-    ipa: '/ðə ˈwɛðər ɪz ˈbjutəfəl təˈdeɪ/',
-    translation: 'O tempo está lindo hoje'
-  },
-  {
-    id: 4,
-    text: "I would like to order a coffee",
-    difficulty: 'medium',
-    ipa: '/aɪ wʊd laɪk tu ˈɔrdər ə ˈkɔfi/',
-    translation: 'Eu gostaria de pedir um café'
-  },
-  {
-    id: 5,
-    text: "Could you please repeat that?",
-    difficulty: 'medium',
-    ipa: '/kʊd ju pliz rɪˈpit ðæt/',
-    translation: 'Você poderia repetir isso, por favor?'
-  },
-  {
-    id: 6,
-    text: "Pronunciation practice is important",
-    difficulty: 'hard',
-    ipa: '/prəˌnʌnsiˈeɪʃən ˈpræktɪs ɪz ɪmˈpɔrtənt/',
-    translation: 'Prática de pronúncia é importante'
-  },
-];
-
-function getRandomPhrase(difficulty = null) {
-  const filtered = difficulty
-    ? PHRASES.filter(p => p.difficulty === difficulty)
-    : PHRASES;
-
-  return filtered[Math.floor(Math.random() * filtered.length)];
-}
-
-function getPhraseById(id) {
-  return PHRASES.find(p => p.id === id);
-}
-
-/**
- * ========================================
- * HANDLER DA API VERCEL
+ * MAIN HANDLER
  * ========================================
  */
 export default async function handler(req, res) {
   // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }
 
+  // ========================================
+  // GET - Buscar Frase
+  // ========================================
   if (req.method === 'GET') {
-      const { difficulty, phraseId } = req.query;
+    try {
+      const { phraseId, difficulty, random } = req.query;
 
+      // Busca frase específica por ID
       if (phraseId) {
-        const phrase = getPhraseById(parseInt(phraseId));
-        return res.status(200).json({ success: true, phrase });
+        const phrase = await PhraseRepository.getPhraseById(phraseId);
+
+        if (!phrase) {
+          return res.status(404).json({
+            success: false,
+            error: 'Phrase not found'
+          });
+        }
+
+        // Adiciona IPA se a frase não tiver
+        if (!phrase.ipa && phrase.text) {
+          phrase.ipa = convertTextToIPA(phrase.text);
+          phrase.ipaCoverage = getIPACoverage(phrase.text);
+        }
+
+        return res.status(200).json({
+          success: true,
+          phrase
+        });
       }
 
-      const phrase = getRandomPhrase(difficulty);
-      return res.status(200).json({ success: true, phrase });
-    }
+      // Busca frase aleatória
+      if (random === 'true') {
+        const environment = process.env.NODE_ENV === 'production' ? 'production' : 'development';
+        const phrase = await PhraseRepository.getRandomPhrase(difficulty, environment);
 
-  if (req.method !== 'POST' || req.method !== 'GET' ) {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+        if (!phrase) {
+          return res.status(404).json({
+            success: false,
+            error: 'No phrases found'
+          });
+        }
 
-  try {
-    const { audio, expectedText, phraseId } = req.body;
+        // Adiciona IPA
+        if (!phrase.ipa && phrase.text) {
+          phrase.ipa = convertTextToIPA(phrase.text);
+          phrase.ipaCoverage = getIPACoverage(phrase.text);
+        }
 
-    // Validação
-    if (!audio) {
-      return res.status(400).json({ error: 'Audio is required' });
-    }
-
-    // Se phraseId foi fornecido, busca a frase
-    let expected = expectedText;
-    let phraseData = null;
-
-    if (phraseId) {
-      phraseData = getPhraseById(phraseId);
-      if (phraseData) {
-        expected = phraseData.text;
+        return res.status(200).json({
+          success: true,
+          phrase
+        });
       }
-    }
 
-    if (!expected) {
-      return res.status(400).json({ error: 'Expected text or phraseId is required' });
-    }
-
-    // Converte base64 para Buffer
-    const audioBuffer = Buffer.from(audio, 'base64');
-
-    // 1. Transcreve com Wit.ai
-    const witService = new WitAIService(process.env.WIT_AI_TOKEN);
-    const transcription = await witService.transcribe(audioBuffer);
-
-    if (!transcription.isSuccess) {
-      return res.status(200).json({
+      return res.status(400).json({
         success: false,
-        error: 'Could not transcribe audio. Please try again.'
+        error: 'Missing required parameters: phraseId or random=true'
+      });
+
+    } catch (error) {
+      console.error('GET Error:', error);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to fetch phrase',
+        details: error.message
       });
     }
-
-    // 2. Analisa pronúncia
-    const analyzer = new PronunciationAnalyzer();
-    const analysis = analyzer.analyze(expected, transcription.text);
-    const tips = analyzer.generateTips(analysis.wordByWord);
-
-    // 3. Retorna resultado
-    return res.status(200).json({
-      success: true,
-      transcription: transcription.text,
-      analysis: analysis,
-      tips: tips,
-      phrase: phraseData
-    });
-
-  } catch (error) {
-    console.error('API Error:', error);
-    return res.status(500).json({
-      success: false,
-      error: 'Internal server error',
-      details: error.message
-    });
   }
+
+  // ========================================
+  // POST - Analisar Pronúncia
+  // ========================================
+  if (req.method === 'POST') {
+    try {
+      const { audio, expectedText, phraseId } = req.body;
+
+      // Validação
+      if (!audio) {
+        return res.status(400).json({
+          success: false,
+          error: 'Audio is required'
+        });
+      }
+
+      // Determina o texto esperado
+      let expected = expectedText;
+      let phraseData = null;
+
+      if (phraseId) {
+        phraseData = await PhraseRepository.getPhraseById(phraseId);
+        if (phraseData) {
+          expected = phraseData.text;
+        }
+      }
+
+      if (!expected) {
+        return res.status(400).json({
+          success: false,
+          error: 'Expected text or valid phraseId is required'
+        });
+      }
+
+      // Converte base64 para Buffer
+      const audioBuffer = Buffer.from(audio, 'base64');
+
+      // 1. Transcreve com Wit.ai
+      const witToken = process.env.WIT_AI_TOKEN;
+      if (!witToken) {
+        return res.status(500).json({
+          success: false,
+          error: 'WIT_AI_TOKEN not configured'
+        });
+      }
+
+      const witService = new WitAIService(witToken);
+      const transcription = await witService.transcribe(audioBuffer);
+
+      if (!transcription.isSuccess) {
+        return res.status(200).json({
+          success: false,
+          error: 'Could not transcribe audio. Please speak clearly and try again.',
+          transcription: transcription.text
+        });
+      }
+
+      // 2. Analisa pronúncia usando phonemeAnalyzer
+      const analysis = analyzePronunciation(expected, transcription.text);
+
+      // 3. Gera feedback
+      const feedback = generateFeedback(analysis.accuracy);
+
+      // 4. Obtém dicas de pronúncia
+      const tips = getPronunciationTips(analysis.problematicWords);
+
+      // 5. Adiciona IPA para referência
+      const expectedIPA = convertTextToIPA(expected);
+      const spokenIPA = convertTextToIPA(transcription.text);
+      const ipaCoverage = getIPACoverage(expected);
+
+      // 6. Retorna resultado completo
+      return res.status(200).json({
+        success: true,
+        transcription: transcription.text,
+        transcriptionConfidence: transcription.confidence,
+
+        analysis: {
+          ...analysis,
+          feedback,
+          tips,
+        },
+
+        ipa: {
+          expected: expectedIPA,
+          spoken: spokenIPA,
+          coverage: ipaCoverage
+        },
+
+        phrase: phraseData
+      });
+
+    } catch (error) {
+      console.error('POST Error:', error);
+      return res.status(500).json({
+        success: false,
+        error: 'Analysis failed',
+        details: error.message
+      });
+    }
+  }
+
+  // Método não permitido
+  return res.status(405).json({
+    success: false,
+    error: 'Method not allowed'
+  });
 }
 
 /**
  * ========================================
- * ENDPOINT AUXILIAR: GET RANDOM PHRASE
+ * HELPER: GET PHRASE (Endpoint separado opcional)
  * ========================================
  */
 export async function getPhrase(req, res) {
@@ -403,11 +349,25 @@ export async function getPhrase(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const { difficulty } = req.query;
-  const phrase = getRandomPhrase(difficulty);
+  try {
+    const { phraseId, difficulty } = req.query;
 
-  return res.status(200).json({
-    success: true,
-    phrase
-  });
+    if (phraseId) {
+      const phrase = await PhraseRepository.getPhraseById(phraseId);
+      return res.status(200).json({ success: true, phrase });
+    }
+
+    const environment = process.env.NODE_ENV === 'production' ? 'production' : 'development';
+    const phrase = await PhraseRepository.getRandomPhrase(difficulty, environment);
+
+    return res.status(200).json({ success: true, phrase });
+
+  } catch (error) {
+    console.error('getPhrase Error:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to fetch phrase',
+      details: error.message
+    });
+  }
 }
